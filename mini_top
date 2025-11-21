@@ -1,0 +1,203 @@
+`timescale 1ns/1ps
+`default_nettype none
+
+module mini_top(
+    input CLOCK_50,
+    input [3:0] SW,
+    input reset,        // KEY[0] (Hardware Reset)
+    input PS2_CLK,
+    input PS2_DAT,
+
+    output [6:0] HEX0, HEX1, HEX2, HEX3,
+    output [9:0] LEDR,
+
+    output wire [3:0] VGA_R, VGA_G, VGA_B,
+    output wire       VGA_HS, VGA_VS, VGA_CLK, VGA_BLANK_N, VGA_SYNC_N
+);
+
+    // 1. 클럭 생성
+    reg [24:0] cnt; always @(posedge CLOCK_50) cnt <= cnt + 1;
+    wire cpu_clk = cnt[20]; // CPU 속도
+    reg clk_25; always @(posedge CLOCK_50) clk_25 <= ~clk_25;
+
+    // 2. 키보드 입력
+    wire ps2_ready; wire [7:0] make_code;
+    ps2_keyboard kb (.clk(CLOCK_50), .rst_n(reset), .ps2_clk(PS2_CLK), .ps2_data(PS2_DAT), .keycode(make_code), .key_valid(ps2_ready));
+
+    reg is_digit, is_op, is_eq, is_bs, is_esc, is_sign;
+    reg [3:0] digit;
+    reg [2:0] op_code; 
+    
+    always @(*) begin
+        is_digit=0; digit=0; is_op=0; is_eq=0; is_bs=0; is_esc=0; is_sign=0; op_code=0;
+        case (make_code)
+            8'h16: begin is_digit=1; digit=1; end 8'h1E: begin is_digit=1; digit=2; end
+            8'h26: begin is_digit=1; digit=3; end 8'h25: begin is_digit=1; digit=4; end
+            8'h2E: begin is_digit=1; digit=5; end 8'h36: begin is_digit=1; digit=6; end
+            8'h3D: begin is_digit=1; digit=7; end 8'h3E: begin is_digit=1; digit=8; end
+            8'h46: begin is_digit=1; digit=9; end 8'h45: begin is_digit=1; digit=0; end
+            
+            8'h79: begin is_op=1; op_code=1; end // +
+            8'h7B: begin is_op=1; op_code=2; end // -
+            8'h7C: begin is_op=1; op_code=3; end // *
+            8'h4A: begin is_op=1; op_code=4; end // /
+            
+            8'h5A: is_eq=1;   // Enter
+            8'h66: is_bs=1;   // Backspace
+            8'h54: is_sign=1; // [ (+/-)
+            8'h76: is_esc=1;  // ESC
+        endcase
+    end
+
+    // 펄스 생성
+    reg ready_d, prev_was_f0;
+    always @(posedge CLOCK_50) begin
+        ready_d <= ps2_ready;
+        if (ps2_ready && !ready_d) begin if (make_code == 8'hF0) prev_was_f0 <= 1; else prev_was_f0 <= 0; end
+    end
+    wire ready_rising = ps2_ready && !ready_d;
+    wire is_make = (make_code != 8'hF0) && (make_code != 8'hE0) && (prev_was_f0 == 0);
+
+    wire digit_pulse = ready_rising && is_digit && is_make;
+    wire op_pulse    = ready_rising && is_op    && is_make;
+    wire enter_pulse = ready_rising && is_eq    && is_make;
+    wire bs_pulse    = ready_rising && is_bs    && is_make;
+    wire sign_pulse  = ready_rising && is_sign  && is_make;
+    wire esc_pulse   = ready_rising && is_esc   && is_make;
+
+    // 3. [핵심 수정] 강력한 리셋 로직
+    wire [15:0] pc_out;
+    wire is_finished = (pc_out >= 16'd3); // STOP 상태
+    wire auto_restart = is_finished && digit_pulse;
+
+    reg [3:0] reset_cnt;
+    // ESC를 누르거나, 자동 재시작 조건이면 카운터를 15로 설정
+    always @(posedge CLOCK_50) begin 
+        if (esc_pulse || auto_restart) reset_cnt <= 15; 
+        else if (reset_cnt > 0) reset_cnt <= reset_cnt - 1; 
+    end
+    
+    // 시스템 리셋 신호: KEY0(reset)이 눌렸거나(0), 내부 리셋 카운터가 돌고 있으면(0)
+    wire system_reset_n = reset && (reset_cnt == 0);
+
+    // 4. 연산자 저장소
+    reg [2:0] saved_op;
+    always @(posedge CLOCK_50 or negedge system_reset_n) begin
+        if (!system_reset_n) saved_op <= 3'd1; 
+        else if (op_pulse)   saved_op <= op_code;
+    end
+
+    // 5. 입력 버퍼
+    wire cpu_wait_input, buffer_clear;   
+    wire [15:0] buffer_val;
+
+    digit_buffer input_unit (
+        .clk(CLOCK_50), .reset_n(system_reset_n), .clear(buffer_clear),
+        .digit_valid(digit_pulse && cpu_wait_input),
+        .backspace(bs_pulse && cpu_wait_input),
+        .toggle_sign(sign_pulse && cpu_wait_input),
+        .digit(digit), .value(buffer_val)
+    );
+
+    reg [15:0] input_snapshot;
+    always @(posedge CLOCK_50) begin
+        if (!system_reset_n) input_snapshot <= 0;
+        else if (enter_pulse && cpu_wait_input) input_snapshot <= buffer_val;
+    end
+
+    // 6. CPU 연결
+    wire [15:0] pc_next, instr;
+    wire pc_en, rf_we, use_imm;
+    wire [3:0] rf_waddr, rf_raddr_a, rf_raddr_b;
+    wire [4:0] alu_op;
+
+    assign pc_next = pc_out + 16'd1;
+    
+    // [중요] PC 리셋 확실하게 연결
+    pc cpu_pc (.clk(cpu_clk), .rst_n(system_reset_n), .pc_en(pc_en), .pc_next(pc_next), .pc(pc_out));
+    
+    bram16 #(.ADDR_WIDTH(9)) imem (
+        .clk(cpu_clk), .en_a(1'b1), .we_a(1'b0), .addr_a(pc_out[8:0]), .din_a(0), .dout_a(instr),
+        .en_b(0), .we_b(0), .addr_b(0), .din_b(0), .dout_b()
+    );
+
+    // PC 변경 감지 및 핸드셰이크
+    reg [15:0] prev_pc;
+    always @(posedge CLOCK_50) begin
+        if (!system_reset_n) prev_pc <= 0;
+        else prev_pc <= pc_out;
+    end
+    wire pc_changed = (pc_out != prev_pc);
+
+    reg enter_flag;
+    always @(posedge CLOCK_50) begin
+        if (!system_reset_n) enter_flag <= 0; // 리셋 시 플래그 강제 초기화
+        else if (pc_changed) enter_flag <= 0; 
+        else if (cpu_wait_input && enter_pulse) enter_flag <= 1; 
+    end
+
+    fsm cpu_fsm (
+        .clk(cpu_clk), 
+        .rst_n(system_reset_n), // 리셋 연결
+        .instr(instr),
+        .key_valid(enter_flag),      
+        .user_op(saved_op),          
+        .pc_en(pc_en), 
+        .rf_we(rf_we), 
+        .rf_waddr(rf_waddr), 
+        .rf_raddr_a(rf_raddr_a), 
+        .rf_raddr_b(rf_raddr_b), 
+        .alu_op(alu_op), 
+        .use_imm(use_imm),
+        .is_input(cpu_wait_input)
+    );
+    
+    assign buffer_clear = pc_changed && cpu_wait_input;
+
+    wire [15:0] rdata_a, rdata_b, wdata, alu_result;
+    regfile cpu_rf (.clk(cpu_clk), .rst(~system_reset_n), .we(rf_we), .w_addr(rf_waddr), .w_data(wdata), .ra_addr(rf_raddr_a), .rb_addr(rf_raddr_b), .ra_data(rdata_a), .rb_data(rdata_b));
+
+    wire [15:0] alu_b_in = use_imm ? {12'd0, instr[3:0]} : rdata_b;
+    
+    alu16 cpu_alu (
+        .a(rdata_a), .b(alu_b_in), .alu_op(alu_op), 
+        .shamt(0), .psr_c_in(0), .flags_en(0), .flags_sel(0), .flags_out(), .flags_raw(),
+        .y(alu_result), .y_valid()
+    );
+    
+    // [중요] 리셋 시 결과값 레지스터도 확실하게 0으로 초기화
+    reg [15:0] last_result;
+    always @(posedge cpu_clk) begin
+        if (!system_reset_n) last_result <= 0;
+        else if (!cpu_wait_input && rf_we && !is_finished) last_result <= alu_result;
+    end
+
+    assign wdata = (cpu_wait_input) ? input_snapshot : alu_result;
+
+    // 7. 출력
+    wire show_input = cpu_wait_input; 
+    wire [15:0] display_raw = show_input ? buffer_val : last_result;
+    
+    wire is_neg = display_raw[15];
+    wire [15:0] display_abs = is_neg ? (~display_raw + 1) : display_raw;
+    wire is_div_mode = (saved_op == 4) && (!cpu_wait_input); 
+
+    vga_controller vga_inst (
+        .clk(clk_25), .rst_n(system_reset_n), .display_num(display_abs),
+        .is_div_mode(is_div_mode), .is_negative(is_neg),
+        .vga_r(VGA_R), .vga_g(VGA_G), .vga_b(VGA_B), .vga_hs(VGA_HS), .vga_vs(VGA_VS), .vga_clk(VGA_CLK), .vga_blank_n(VGA_BLANK_N), .vga_sync_n(VGA_SYNC_N)
+    );
+
+    wire [3:0] b1, b2, b3, b4;
+    bcd_converter bcd (.bin(display_abs), .thou(b1), .hun(b2), .ten(b3), .one(b4));
+    function [6:0] seg; input [3:0] x; case(x) 0:seg=64; 1:seg=121; 2:seg=36; 3:seg=48; 4:seg=25; 5:seg=18; 6:seg=2; 7:seg=120; 8:seg=0; 9:seg=24; default:seg=127; endcase endfunction
+    
+    assign HEX3=seg(b1); assign HEX2=seg(b2); assign HEX1=seg(b3); assign HEX0=seg(b4);
+    
+    assign LEDR[0] = cpu_wait_input; 
+    assign LEDR[9] = is_div_mode;
+    assign LEDR[8] = is_neg;
+    assign LEDR[1] = is_finished; 
+
+endmodule
+`default_nettype wire
